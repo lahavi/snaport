@@ -1,0 +1,24 @@
+# Binaries
+*.exe
+*.exe~
+/snaport
+dist/
+
+# Test artifacts
+*.img
+*.img.zst
+*.state.json
+*.test
+testdata/output/
+
+# Go
+*.out
+coverage.*
+
+# Editors / OS
+.idea/
+.vscode/
+.zcode/
+*.swp
+Thumbs.db
+.DS_Store
