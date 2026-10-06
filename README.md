@@ -3,13 +3,15 @@
 **snaport** downloads AWS EC2 EBS snapshots (standalone, or every volume of an
 AMI) using the official [EBS Direct APIs](https://docs.aws.amazon.com/ebs/latest/essbs/ebs-direct-api.html)
 — no volumes, no instances, no third-party snapshot tools — and stores them as
-**NTFS sparse raw images** on your Windows machine: only allocated blocks
-consume disk space. Every block is checksum-verified against the value AWS
-returns, the whole image is hashed, and the result is compressed with zstd and
-restore-tested before the raw image is discarded.
+**sparse raw images**: only allocated blocks consume disk space. Every block
+is checksum-verified against the value AWS returns, the whole image is hashed,
+and the result is compressed with zstd and restore-tested before the raw
+image is discarded.
 
-Windows-first; the code paths are portable (Linux/macOS sparse files work too,
-just not the primary target).
+Born Windows-first; since v0.2 Linux is an equally supported release target —
+prebuilt binaries for `windows-amd64`, `linux-amd64` and `linux-arm64`, and
+it builds on macOS too. On Windows the images are NTFS sparse files; on
+Linux they are plain sparse files you can loop-mount directly.
 
 ## Why
 
@@ -25,16 +27,21 @@ just not the primary target).
 
 ## Install
 
-Requires Go 1.22+:
+Download a prebuilt binary from the
+[releases page](https://github.com/lahavi/snaport/releases) — Windows amd64
+zip, Linux amd64/arm64 tarballs, plus a SHA-256 checksums file.
+
+Or build from source (requires Go 1.27+):
 
 ```
-go build -o snaport.exe ./cmd/snaport
+go build -o snaport ./cmd/snaport          # Linux / macOS
+go build -o snaport.exe ./cmd/snaport      # Windows
 ```
 
 or with a version stamp:
 
 ```
-go build -ldflags "-X snaport/internal/cli.Version=0.1.0" -o snaport.exe ./cmd/snaport
+go build -ldflags "-X snaport/internal/cli.Version=0.2.0" -o snaport ./cmd/snaport
 ```
 
 ## Usage
@@ -60,7 +67,7 @@ Credentials and region resolve through the standard AWS chain (env vars,
 | `--zstd-level` | 6 | compression level 1-19 |
 | `--keep-raw` | off | keep the sparse raw image next to the `.zst` after verified compression |
 | `--no-compress` | off | keep only the raw sparse image |
-| `--ntfs-compress` | off | also apply transparent NTFS compression to the raw image |
+| `--ntfs-compress` | off | also apply transparent NTFS compression to the raw image (Windows only) |
 | `--paranoid-resume` | off | spot-check already-downloaded blocks against checksums when resuming |
 | `--force` | off | discard manifest/journal/image and restart |
 | `--dry-run` | off | list blocks; estimate sizes, AWS cost and free space; transfer nothing |
@@ -79,7 +86,8 @@ Credentials and region resolve through the standard AWS chain (env vars,
    base64 SHA-256 the API returns against the downloaded bytes before
    accepting them.
 3. Each verified block is written at `blockIndex × blockSize` in a
-   **sparse** image file (marked via `FSCTL_SET_SPARSE` on NTFS).
+   **sparse** image file (marked via `FSCTL_SET_SPARSE` on NTFS; plain
+   sparse files on Linux/macOS).
    Unallocated regions and allocated-but-zero blocks are never written —
    they stay holes and read back as zeros, exactly matching EBS semantics.
    The file's logical length is set to exactly `volumeGiB × 1 GiB`.
@@ -111,10 +119,21 @@ and your free space before anything is transferred.
 
 ## Browsing a downloaded image
 
-Downloaded images are raw disk images (GPT/MBR partitioned), so Windows
-needs help to look inside:
+Downloaded images are raw disk images (GPT/MBR partitioned), so they need a
+little help to browse:
 
-- **Linux filesystems (ext4/XFS - typical EC2 root volumes)** - use WSL2:
+- **On Linux** - no helper needed, loop-mount it read-only:
+
+  ```
+  sudo losetup -fP --show snap-xxxx.img     # prints the assigned /dev/loopN
+  sudo mount -o ro /dev/loopNp1 /mnt        # add ,norecovery for XFS images
+  ```
+
+  The `norecovery` option is for XFS images that were snapshotted while
+  mounted. Detach with `sudo umount /mnt && sudo losetup -D`.
+
+- **Linux filesystems (ext4/XFS - typical EC2 root volumes), from Windows** -
+  use WSL2:
 
   ```
   tools\mount-image.cmd C:\path\to\snap-xxxx.img
