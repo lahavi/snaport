@@ -13,6 +13,24 @@ import (
 
 func markSparse(f *os.File) error { return nil }
 
+// zeroBuffer backs the POSIX zeroRange fallback.
+var zeroBuffer = make([]byte, 4096)
+
+// zeroRange overwrites the range with zeros; POSIX sparse files re-punch
+// all-zero pages automatically in most filesystems.
+func zeroRange(f *os.File, offset, length int64) error {
+	buf := zeroBuffer
+	for length > 0 {
+		n := min(length, int64(len(buf)))
+		if _, err := f.WriteAt(buf[:n], offset); err != nil {
+			return err
+		}
+		offset += n
+		length -= n
+	}
+	return nil
+}
+
 // EnableNTFSCompression is a no-op outside Windows.
 func EnableNTFSCompression(f *os.File) error {
 	return fmt.Errorf("NTFS compression is only available on Windows")

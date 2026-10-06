@@ -25,6 +25,7 @@ type Journal struct {
 	path       string
 	snapshotID string
 	blocks     int
+	base       string // lineage base for incremental runs
 	entries    map[int]JournalEntry
 	pending    []JournalEntry
 	f          *os.File
@@ -40,7 +41,10 @@ type JournalEntry struct {
 }
 
 type journalHeader struct {
-	V      int    `json:"v"`
+	V int `json:"v"`
+	// Base is the lineage base snapshot for incremental runs ("" for
+	// full downloads). A resume with a different base is refused.
+	Base   string `json:"base,omitempty"`
 	ID     string `json:"id"`
 	Blocks int    `json:"blocks"`
 }
@@ -55,11 +59,12 @@ func (e *JournalMismatchError) Error() string {
 
 // OpenJournal opens (creating if absent) the journal at path. When the
 // file exists its header must match snapshotID and blockCount.
-func OpenJournal(path, snapshotID string, blockCount int) (*Journal, error) {
+func OpenJournal(path, snapshotID string, blockCount int, baseSnapshotID string) (*Journal, error) {
 	j := &Journal{
 		path:       path,
 		snapshotID: snapshotID,
 		blocks:     blockCount,
+		base:       baseSnapshotID,
 		entries:    make(map[int]JournalEntry),
 	}
 
@@ -94,7 +99,7 @@ func (j *Journal) headerNeeded() bool {
 }
 
 func (j *Journal) writeHeader() error {
-	h := journalHeader{V: 1, ID: j.snapshotID, Blocks: j.blocks}
+	h := journalHeader{V: 1, Base: j.base, ID: j.snapshotID, Blocks: j.blocks}
 	line, err := json.Marshal(h)
 	if err != nil {
 		return err
@@ -131,6 +136,9 @@ func (j *Journal) replay() error {
 			}
 			if h.ID != j.snapshotID {
 				return &JournalMismatchError{Path: j.path, Detail: fmt.Sprintf("belongs to snapshot %s, not %s", h.ID, j.snapshotID)}
+			}
+			if h.Base != j.base {
+				return &JournalMismatchError{Path: j.path, Detail: fmt.Sprintf("is an incremental sync from base %q, not %q", h.Base, j.base)}
 			}
 			if h.Blocks != j.blocks {
 				return &JournalMismatchError{Path: j.path, Detail: fmt.Sprintf("expects %d blocks, listing produced %d", h.Blocks, j.blocks)}

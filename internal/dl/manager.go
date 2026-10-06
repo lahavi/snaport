@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -39,6 +40,9 @@ type Options struct {
 	// ParanoidResume spot-checks already-downloaded blocks against their
 	// recorded checksums before trusting resume state.
 	ParanoidResume bool
+	// BaseVerifySample is how many base-image blocks an incremental run
+	// spot-checks before building on the base (0 = full verification).
+	BaseVerifySample int
 	// NTFSCompress enables transparent NTFS compression on the raw image
 	// (best effort, Windows only).
 	NTFSCompress bool
@@ -73,6 +77,11 @@ type Request struct {
 	StatePath    string // journal location
 	Compress     *CompressOptions
 	Force        bool // discard any existing state and restart
+	// BaseManifest enables incremental mode: it is the completed
+	// manifest of a previous snapshot of the same volume lineage, whose
+	// image must already be at ImagePath. Only blocks that changed
+	// between the base and SnapshotID are fetched.
+	BaseManifest *manifest.Manifest
 }
 
 // Result summarizes a completed run.
@@ -85,6 +94,13 @@ type Result struct {
 	ImageOnDisk    int64 // actual disk usage of the raw image, if kept
 	CompressedSize int64
 	Duration       time.Duration
+	// DeltaFrom is the base snapshot ID when this was an incremental run.
+	DeltaFrom string
+	// ChangedBlocks counts blocks fetched relative to the base (delta runs).
+	ChangedBlocks int
+	// ZeroedBlocks counts blocks deallocated between base and target
+	// (delta runs): their ranges were returned to holes.
+	ZeroedBlocks int
 }
 
 // Manager downloads snapshots using a worker pool over a block source.
@@ -112,6 +128,18 @@ func fillDefaults(o *Options) {
 	if o.CheckpointEvery <= 0 {
 		o.CheckpointEvery = 5 * time.Second
 	}
+	if o.BaseVerifySample == 0 {
+		o.BaseVerifySample = 32
+	}
+}
+
+// baseSnapshotID returns the lineage base for journal validation
+// ("" for full downloads).
+func (r *Request) baseSnapshotID() string {
+	if r.BaseManifest != nil {
+		return r.BaseManifest.SnapshotID
+	}
+	return ""
 }
 
 // Run executes the full pipeline for one snapshot: list, download
@@ -130,17 +158,25 @@ func (m *Manager) Run(ctx context.Context, req *Request) (*Result, error) {
 
 	m.progress(Update{Phase: PhaseList})
 	lister := ebsx.NewLister(m.src, req.SnapshotID, m.opts.ListPageSize)
-	info, err := lister.ListAll(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("listing blocks of %s: %w", req.SnapshotID, err)
-	}
 
-	man, err := m.reconcileManifest(req, info)
+	var man *manifest.Manifest
+	var zeros []zeroRangePlan
+	var dinfo deltaInfo
+	var err error
+	if req.BaseManifest != nil {
+		man, zeros, dinfo, err = m.buildDeltaManifest(ctx, req, lister)
+	} else {
+		var info *ebsx.SnapshotInfo
+		info, err = lister.ListAll(ctx)
+		if err == nil {
+			man, err = m.reconcileManifest(req, info)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
 
-	jrn, err := OpenJournal(req.StatePath, req.SnapshotID, len(info.Blocks))
+	jrn, err := OpenJournal(req.StatePath, req.SnapshotID, len(man.Blocks), req.baseSnapshotID())
 	if err != nil {
 		var mm *JournalMismatchError
 		if errors.As(err, &mm) {
@@ -172,10 +208,12 @@ func (m *Manager) Run(ctx context.Context, req *Request) (*Result, error) {
 
 	var stats downloadStats
 	var zeroBlocks int
+	delta := req.BaseManifest != nil
 	// Open the image even with nothing pending when a paranoid spot-check
-	// is requested: the check may invalidate journal entries and create
-	// pending work.
-	if len(pending) > 0 || (m.opts.ParanoidResume && resumed > 0) {
+	// is requested, or when a delta needs to zero deallocated ranges or
+	// grow the logical size.
+	deltaImageWork := delta && (len(zeros) > 0 || man.LogicalSize != req.BaseManifest.LogicalSize)
+	if len(pending) > 0 || (m.opts.ParanoidResume && resumed > 0) || deltaImageWork {
 		writer, err := img.NewWriter(req.ImagePath, man.LogicalSize)
 		if err != nil {
 			return nil, err
@@ -185,6 +223,14 @@ func (m *Manager) Run(ctx context.Context, req *Request) (*Result, error) {
 			// Best effort; non-fatal on non-NTFS volumes.
 			if err := writer.EnableNTFSCompression(); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: NTFS compression not applied: %v\n", err)
+			}
+		}
+
+		// Return deallocated base blocks to holes before fetching.
+		for _, z := range zeros {
+			if err := writer.ZeroRange(z.Offset, z.Length); err != nil {
+				writer.Close()
+				return nil, err
 			}
 		}
 
@@ -208,21 +254,25 @@ func (m *Manager) Run(ctx context.Context, req *Request) (*Result, error) {
 				writer.Close()
 				return nil, err
 			}
-			// Fill in lengths/checksums discovered during this run.
-			for i := range man.Blocks {
-				if e, ok := jrn.Get(i); ok {
-					man.Blocks[i].Length = e.Length
-					man.Blocks[i].SHA256 = e.SHA256
-				}
-			}
-			var alloc int64
-			for _, b := range man.Blocks {
-				alloc += b.Length
-			}
-			man.AllocatedBytes = alloc
 		}
 		writer.Close()
 	}
+
+	// Merge journal completions and recompute allocated bytes (also
+	// needed for deltas whose only changes were deallocations).
+	for i := range man.Blocks {
+		if man.Blocks[i].SHA256 == "" {
+			if e, ok := jrn.Get(i); ok {
+				man.Blocks[i].Length = e.Length
+				man.Blocks[i].SHA256 = e.SHA256
+			}
+		}
+	}
+	var alloc int64
+	for _, b := range man.Blocks {
+		alloc += b.Length
+	}
+	man.AllocatedBytes = alloc
 
 	if man.ImageSHA256 == "" {
 		if _, err := os.Stat(req.ImagePath); os.IsNotExist(err) {
@@ -252,6 +302,11 @@ func (m *Manager) Run(ctx context.Context, req *Request) (*Result, error) {
 		ZeroBlocks:    zeroBlocks,
 		ImageSHA256:   man.ImageSHA256,
 		Duration:      time.Since(start),
+	}
+	if req.BaseManifest != nil {
+		res.DeltaFrom = req.BaseManifest.SnapshotID
+		res.ChangedBlocks = dinfo.Changed
+		res.ZeroedBlocks = dinfo.Zeroed
 	}
 
 	if req.Compress != nil && man.Compression == nil {
@@ -487,6 +542,145 @@ func paranoidCheck(ctx context.Context, writer *img.Writer, man *manifest.Manife
 		}
 	}
 	return nil
+}
+
+// zeroRangePlan is one deallocated range to punch back to zeros.
+type zeroRangePlan struct {
+	Offset int64
+	Length int64
+}
+
+// deltaInfo carries incremental-run counters for reporting.
+type deltaInfo struct {
+	Changed int // data-bearing changed blocks vs the base
+	Zeroed  int // blocks deallocated between base and target
+}
+
+// buildDeltaManifest constructs the target manifest for an incremental
+// run: it verifies the base image still matches the base manifest, lists
+// the changed blocks via ListChangedBlocks, and derives the target block
+// set (unchanged blocks keep their recorded checksums; changed ones are
+// pending refetches; deallocated ones are dropped and their ranges
+// returned to holes by the caller).
+//
+// It is idempotent: if a completed manifest for the target already
+// exists, it is returned as-is (no delta work remains).
+func (m *Manager) buildDeltaManifest(ctx context.Context, req *Request, lister *ebsx.Lister) (*manifest.Manifest, []zeroRangePlan, deltaInfo, error) {
+	base := req.BaseManifest
+
+	// A usable base must be a completed download.
+	if base.ImageSHA256 == "" {
+		return nil, nil, deltaInfo{}, fmt.Errorf("base manifest %s has no verified image hash (not from a completed download)", base.SnapshotID)
+	}
+	for i, b := range base.Blocks {
+		if b.SHA256 == "" {
+			return nil, nil, deltaInfo{}, fmt.Errorf("base manifest %s is incomplete (block ordinal %d lacks a checksum)", base.SnapshotID, i)
+		}
+	}
+
+	// Idempotent re-run: a completed target manifest means no delta work.
+	if st, err := os.Stat(req.ManifestPath); err == nil && !st.IsDir() {
+		if existing, err := manifest.Load(req.ManifestPath); err == nil &&
+			existing.SnapshotID == req.SnapshotID && existing.ImageSHA256 != "" {
+			return existing, nil, deltaInfo{}, nil
+		}
+	}
+
+	// Resuming an interrupted delta: the image is already partially
+	// migrated to the target, so the base no longer verifies against it.
+	// The journal (which OpenJournal validates against the same base
+	// lineage) plus the final full verification carry correctness.
+	if _, err := os.Stat(req.StatePath); err != nil && os.IsNotExist(err) {
+		// Fresh delta. A previously aborted attempt may have grown the
+		// image past the base size; shrink it back so base verification
+		// sees the exact size.
+		if st, err := os.Stat(req.ImagePath); err == nil && st.Size() > base.LogicalSize {
+			if err := os.Truncate(req.ImagePath, base.LogicalSize); err != nil {
+				return nil, nil, deltaInfo{}, fmt.Errorf("resetting grown image to base size: %w", err)
+			}
+		}
+		m.progress(Update{Phase: PhaseList, BytesTotal: base.LogicalSize})
+		if err := img.VerifySample(ctx, req.ImagePath, base, m.opts.BaseVerifySample); err != nil {
+			return nil, nil, deltaInfo{}, fmt.Errorf("base image %s does not match its manifest: %w (re-download the base or drop --base-manifest)", req.ImagePath, err)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, nil, deltaInfo{}, err
+	}
+
+	changed, volumeGiB, blockSize, err := lister.ListChangedAll(ctx, base.SnapshotID)
+	if err != nil {
+		return nil, nil, deltaInfo{}, fmt.Errorf("listing changed blocks %s..%s: %w", base.SnapshotID, req.SnapshotID, err)
+	}
+	if blockSize != base.BlockSize {
+		return nil, nil, deltaInfo{}, fmt.Errorf("block size changed across the lineage: base %d, target %d", base.BlockSize, blockSize)
+	}
+	if volumeGiB < base.VolumeSizeGiB {
+		return nil, nil, deltaInfo{}, fmt.Errorf("target volume %d GiB is smaller than base %d GiB (unsupported)", volumeGiB, base.VolumeSizeGiB)
+	}
+
+	man := *base
+	man.SnapshotID = req.SnapshotID
+	man.VolumeSizeGiB = volumeGiB
+	man.LogicalSize = volumeGiB * manifest.GiB
+	man.ImageSHA256 = ""
+	man.Compression = nil
+	man.ToolVersion = m.opts.ToolVersion
+	man.ImageFile = filepath.Base(req.ImagePath)
+
+	baseIdx := base.IndexMap()
+	blocks := make([]manifest.Block, 0, len(base.Blocks)+len(changed))
+	var zeros []zeroRangePlan
+	for _, b := range base.Blocks {
+		c, isChanged := changedIdx(changed, b.Index)
+		if !isChanged {
+			blocks = append(blocks, b) // identical data, checksum carries over
+			continue
+		}
+		if c.SecondToken == "" {
+			// Deallocated in the target: drop from the manifest and
+			// return the range to a hole.
+			zeros = append(zeros, zeroRangePlan{Offset: b.Offset, Length: b.Length})
+			continue
+		}
+		nb := b
+		nb.SHA256 = "" // refetch from the target snapshot
+		nb.Length = 0
+		blocks = append(blocks, nb)
+	}
+	// Blocks allocated in the target but absent from the base (volume
+	// grew, or blocks reused after deallocation).
+	for _, c := range changed {
+		if _, inBase := baseIdx[c.Index]; inBase || c.SecondToken == "" {
+			continue
+		}
+		blocks = append(blocks, manifest.Block{Index: c.Index, Offset: c.Index * blockSize})
+	}
+	sort.Slice(blocks, func(i, j int) bool { return blocks[i].Index < blocks[j].Index })
+	man.Blocks = blocks
+	man.BlockCount = len(blocks)
+
+	info := deltaInfo{Changed: countFetched(changed), Zeroed: len(zeros)}
+	return &man, zeros, info, nil
+}
+
+// changedIdx finds a changed-block entry by index (changed listings are
+// sorted, so binary search).
+func changedIdx(changed []ebsx.ChangedBlockRef, index int64) (ebsx.ChangedBlockRef, bool) {
+	i := sort.Search(len(changed), func(i int) bool { return changed[i].Index >= index })
+	if i < len(changed) && changed[i].Index == index {
+		return changed[i], true
+	}
+	return ebsx.ChangedBlockRef{}, false
+}
+
+func countFetched(changed []ebsx.ChangedBlockRef) int {
+	n := 0
+	for _, c := range changed {
+		if c.SecondToken != "" {
+			n++
+		}
+	}
+	return n
 }
 
 // reconcileManifest loads an existing manifest (validating it against the

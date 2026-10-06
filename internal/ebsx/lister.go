@@ -166,6 +166,73 @@ func (l *Lister) listWithRetry(ctx context.Context, nextToken string, startingIn
 // contain a block that a previous listing reported as allocated.
 var ErrBlockMissingFromListing = errors.New("block missing from refreshed listing")
 
+// ListChangedAll pages through ListChangedBlocks between firstSnapshotID
+// and the lister's snapshot (the newer one). Second-snapshot tokens from
+// the changed pages are entered into the shared token store so workers
+// can fetch them (and refresh them) exactly like full-listing tokens.
+func (l *Lister) ListChangedAll(ctx context.Context, firstSnapshotID string) (changed []ChangedBlockRef, volumeGiB int64, blockSize int64, err error) {
+	var nextToken string
+	for page := 0; ; page++ {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, 0, err
+		}
+		p, err := l.listChangedWithRetry(ctx, firstSnapshotID, nextToken, 0)
+		if err != nil {
+			return nil, 0, 0, fmt.Errorf("changed-block listing page %d: %w", page+1, err)
+		}
+		if page == 0 {
+			volumeGiB, blockSize = p.VolumeGiB, p.BlockSize
+		} else if p.VolumeGiB != volumeGiB || p.BlockSize != blockSize {
+			return nil, 0, 0, fmt.Errorf("snapshot %s changed geometry mid-listing (page %d): volume %d->%d GiB, block %d->%d",
+				l.snapshotID, page+1, volumeGiB, p.VolumeGiB, blockSize, p.BlockSize)
+		}
+		// Only data-bearing entries carry fetchable tokens; index them in
+		// the token store for the download workers.
+		withTokens := make([]BlockRef, 0, len(p.Changed))
+		for _, c := range p.Changed {
+			if c.SecondToken != "" {
+				withTokens = append(withTokens, BlockRef{Index: c.Index, Token: c.SecondToken})
+			}
+		}
+		l.store.Inscribe(withTokens, p.ExpiryTime)
+		changed = append(changed, p.Changed...)
+		if p.NextToken == "" {
+			break
+		}
+		nextToken = p.NextToken
+	}
+	for i := 1; i < len(changed); i++ {
+		if changed[i].Index <= changed[i-1].Index {
+			return nil, 0, 0, fmt.Errorf("changed-block listing for %s returned non-monotonic index %d after %d",
+				l.snapshotID, changed[i].Index, changed[i-1].Index)
+		}
+	}
+	if volumeGiB <= 0 || blockSize <= 0 {
+		return nil, 0, 0, fmt.Errorf("changed-block listing for %s returned invalid geometry: volume %d GiB, block size %d",
+			l.snapshotID, volumeGiB, blockSize)
+	}
+	return changed, volumeGiB, blockSize, nil
+}
+
+// listChangedWithRetry wraps ListChangedPage with backoff for transient errors.
+func (l *Lister) listChangedWithRetry(ctx context.Context, firstID, nextToken string, startingIndex int64) (ChangedPage, error) {
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		p, err := l.src.ListChangedPage(ctx, firstID, l.snapshotID, nextToken, startingIndex, l.pageSize)
+		if err == nil {
+			return p, nil
+		}
+		if !IsRetryable(err) {
+			return ChangedPage{}, err
+		}
+		lastErr = err
+		if err := Backoff(ctx, attempt, IsThrottle(err)); err != nil {
+			return ChangedPage{}, err
+		}
+	}
+	return ChangedPage{}, fmt.Errorf("giving up after 5 attempts: %w", lastErr)
+}
+
 // RefreshToken re-lists starting at the given block index to obtain a
 // fresh token for it (block tokens expire). The whole returned page is
 // entered into the token store, so nearby refreshes are amortized.

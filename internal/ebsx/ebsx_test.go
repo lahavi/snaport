@@ -24,8 +24,9 @@ func TestGenericRetryableBranches(t *testing.T) {
 
 // stubSource is a programmable Source for unit tests.
 type stubSource struct {
-	listFn func(ctx context.Context, snapshotID, nextToken string, startingIndex int64, maxResults int32) (ListPage, error)
-	getFn  func(ctx context.Context, snapshotID string, index int64, token string) (BlockData, error)
+	listFn    func(ctx context.Context, snapshotID, nextToken string, startingIndex int64, maxResults int32) (ListPage, error)
+	getFn     func(ctx context.Context, snapshotID string, index int64, token string) (BlockData, error)
+	changedFn func(ctx context.Context, firstID, secondID, nextToken string, startingIndex int64, maxResults int32) (ChangedPage, error)
 }
 
 func (s *stubSource) ListPage(ctx context.Context, id, nt string, si int64, mr int32) (ListPage, error) {
@@ -33,6 +34,12 @@ func (s *stubSource) ListPage(ctx context.Context, id, nt string, si int64, mr i
 }
 func (s *stubSource) GetBlock(ctx context.Context, id string, idx int64, tok string) (BlockData, error) {
 	return s.getFn(ctx, id, idx, tok)
+}
+func (s *stubSource) ListChangedPage(ctx context.Context, firstID, secondID, nt string, si int64, mr int32) (ChangedPage, error) {
+	if s.changedFn == nil {
+		return ChangedPage{}, fmt.Errorf("stubSource: ListChangedPage not configured")
+	}
+	return s.changedFn(ctx, firstID, secondID, nt, si, mr)
 }
 
 func TestListAllPaginationAndGeometry(t *testing.T) {
@@ -273,5 +280,69 @@ func TestSmithyErrorClassification(t *testing.T) {
 	internal := &fakeAPIError{code: "InternalError", msg: "x"}
 	if !IsRetryable(internal) {
 		t.Fatal("internal error should be retryable")
+	}
+}
+
+func TestListChangedAllPaginationAndTokens(t *testing.T) {
+	// 7 changed blocks (one deallocated) served 2 per page.
+	all := []ChangedBlockRef{
+		{Index: 5, SecondToken: "t5"},
+		{Index: 9, SecondToken: ""}, // deallocated
+		{Index: 14, SecondToken: "t14"},
+		{Index: 20, SecondToken: "t20"},
+		{Index: 33, SecondToken: "t33"},
+		{Index: 41, SecondToken: "t41"},
+		{Index: 50, SecondToken: "t50"},
+	}
+	calls := 0
+	src := &stubSource{
+		listFn: func(ctx context.Context, id, nt string, si int64, mr int32) (ListPage, error) {
+			return ListPage{}, fmt.Errorf("unexpected ListPage call")
+		},
+		getFn: func(ctx context.Context, id string, idx int64, tok string) (BlockData, error) {
+			return BlockData{}, fmt.Errorf("unexpected GetBlock call")
+		},
+		changedFn: func(ctx context.Context, firstID, secondID, nt string, si int64, mr int32) (ChangedPage, error) {
+			calls++
+			start := 0
+			if nt != "" {
+				var last int
+				fmt.Sscanf(nt, "p%d", &last)
+				start = last + 1
+			}
+			end := min(start+2, len(all))
+			page := ChangedPage{VolumeGiB: 4, BlockSize: 512 * 1024, ExpiryTime: time.Now().Add(time.Hour)}
+			page.Changed = append(page.Changed, all[start:end]...)
+			if end < len(all) {
+				page.NextToken = fmt.Sprintf("p%d", end-1)
+			}
+			return page, nil
+		},
+	}
+	l := NewLister(src, "snap-next", 2)
+	changed, volGiB, blockSize, err := l.ListChangedAll(context.Background(), "snap-base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 4 {
+		t.Fatalf("pages = %d, want 4", calls)
+	}
+	if volGiB != 4 || blockSize != 512*1024 {
+		t.Fatalf("geometry: %d GiB, block %d", volGiB, blockSize)
+	}
+	if len(changed) != len(all) {
+		t.Fatalf("changed = %d entries, want %d", len(changed), len(all))
+	}
+	for i := range all {
+		if changed[i] != all[i] {
+			t.Fatalf("changed[%d] = %+v, want %+v", i, changed[i], all[i])
+		}
+	}
+	// Data-bearing tokens must be usable through the shared store.
+	if tok, fresh := l.Store().Get(41); !fresh || tok != "t41" {
+		t.Fatalf("store token for 41: %q fresh=%v", tok, fresh)
+	}
+	if _, fresh := l.Store().Get(9); fresh {
+		t.Fatal("deallocated block 9 must not carry a token")
 	}
 }

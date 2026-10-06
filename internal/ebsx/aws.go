@@ -102,6 +102,64 @@ func (s *AWSSource) ListPage(ctx context.Context, snapshotID, nextToken string, 
 	return page, nil
 }
 
+func (s *AWSSource) ListChangedPage(ctx context.Context, firstID, secondID, nextToken string, startingIndex int64, maxResults int32) (ChangedPage, error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+
+	input := &ebs.ListChangedBlocksInput{
+		FirstSnapshotId:  aws.String(firstID),
+		SecondSnapshotId: aws.String(secondID),
+	}
+	if nextToken != "" {
+		input.NextToken = aws.String(nextToken)
+	} else {
+		if startingIndex > 0 {
+			input.StartingBlockIndex = aws.Int32(int32(startingIndex))
+		}
+		if maxResults > 0 && !s.fallbackPageSize {
+			input.MaxResults = aws.Int32(maxResults)
+		}
+	}
+
+	out, err := s.client.ListChangedBlocks(ctx, input)
+	if err != nil {
+		if input.MaxResults != nil && isMaxResultsRejected(err) {
+			s.fallbackPageSize = true
+			input.MaxResults = nil
+			out, err = s.client.ListChangedBlocks(ctx, input)
+		}
+		if err != nil {
+			return ChangedPage{}, classifyListError(err)
+		}
+	}
+
+	page := ChangedPage{}
+	if out.VolumeSize != nil {
+		page.VolumeGiB = *out.VolumeSize
+	}
+	if out.BlockSize != nil {
+		page.BlockSize = int64(*out.BlockSize)
+	}
+	if out.ExpiryTime != nil {
+		page.ExpiryTime = *out.ExpiryTime
+	}
+	if out.NextToken != nil {
+		page.NextToken = *out.NextToken
+	}
+	page.Changed = make([]ChangedBlockRef, 0, len(out.ChangedBlocks))
+	for _, b := range out.ChangedBlocks {
+		if b.BlockIndex == nil {
+			continue
+		}
+		ref := ChangedBlockRef{Index: int64(*b.BlockIndex)}
+		if b.SecondBlockToken != nil {
+			ref.SecondToken = *b.SecondBlockToken
+		}
+		page.Changed = append(page.Changed, ref)
+	}
+	return page, nil
+}
+
 func (s *AWSSource) GetBlock(ctx context.Context, snapshotID string, index int64, token string) (BlockData, error) {
 	ctx, cancel := context.WithTimeout(ctx, getBlockTimeout)
 	defer cancel()

@@ -36,6 +36,7 @@ var downloadFlags struct {
 	quiet          bool
 	egressPerGB    float64
 	wait           time.Duration
+	baseManifest   string
 }
 
 var downloadCmd = &cobra.Command{
@@ -69,6 +70,7 @@ func init() {
 	f.IntVar(&downloadFlags.maxAttempts, "max-attempts", 5, "fetch attempts per block before failing")
 	f.BoolVar(&downloadFlags.rootOnly, "root-only", false, "AMI: download only the root volume")
 	f.DurationVar(&downloadFlags.wait, "wait", 0, "wait up to this duration for pending snapshots to complete, e.g. --wait 15m (default: fail fast)")
+	f.StringVar(&downloadFlags.baseManifest, "base-manifest", "", "incremental mode: manifest of a previously downloaded snapshot in the same volume lineage; only changed blocks are fetched (snapshot mode only)")
 	f.BoolVar(&downloadFlags.quiet, "quiet", false, "suppress the progress display")
 	f.Float64Var(&downloadFlags.egressPerGB, "egress-per-gb", 0.09, "USD per GB of internet data-transfer-out used in --dry-run cost estimates (set 0 to ignore egress, e.g. when running inside AWS)")
 }
@@ -96,6 +98,23 @@ func runDownload(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--zstd-level must be 1-19")
 	}
 
+	// Incremental mode: load the base manifest and, if the raw base
+	// image was deleted after verified compression, rebuild it.
+	var baseMan *manifest.Manifest
+	if downloadFlags.baseManifest != "" {
+		if !strings.HasPrefix(target, "snap-") {
+			return fmt.Errorf("--base-manifest requires a snap-... target (AMI incremental sync is not supported)")
+		}
+		var err error
+		baseMan, err = manifest.Load(downloadFlags.baseManifest)
+		if err != nil {
+			return fmt.Errorf("loading base manifest: %w", err)
+		}
+		if baseMan.Kind != manifest.KindSnapshot {
+			return fmt.Errorf("--base-manifest expects a snapshot manifest, got kind %q", baseMan.Kind)
+		}
+	}
+
 	cfg, err := loadAWSConfig(ctx)
 	if err != nil {
 		return err
@@ -110,6 +129,11 @@ func runDownload(cmd *cobra.Command, args []string) error {
 		jobs, err = snapshotJobs(target)
 		if err != nil {
 			return err
+		}
+		if baseMan != nil && len(jobs) == 1 {
+			if err := prepareBaseImage(ctx, jobs[0], baseMan); err != nil {
+				return err
+			}
 		}
 	case strings.HasPrefix(target, "ami-"):
 		jobs, err = amiJobs(ctx, ec2Client, target)
@@ -131,7 +155,7 @@ func runDownload(cmd *cobra.Command, args []string) error {
 	}
 
 	if downloadFlags.dryRun {
-		return dryRun(ctx, source, jobs)
+		return dryRun(ctx, source, jobs, baseMan)
 	}
 
 	prog := newProgress(downloadFlags.quiet)
@@ -157,6 +181,7 @@ func runDownload(cmd *cobra.Command, args []string) error {
 			ManifestPath: job.manifest,
 			StatePath:    job.state,
 			Force:        downloadFlags.force,
+			BaseManifest: baseMan,
 		}
 		if !downloadFlags.noCompress {
 			req.Compress = &dl.CompressOptions{Level: downloadFlags.zstdLevel, KeepRaw: downloadFlags.keepRaw}
@@ -266,6 +291,24 @@ func amiJobs(ctx context.Context, client *ec2.Client, amiID string) ([]volumeJob
 	return jobs, nil
 }
 
+// prepareBaseImage makes sure the raw base image exists for an
+// incremental run. When it was deleted after verified compression, it is
+// rebuilt (hash-checked) from the .img.zst.
+func prepareBaseImage(ctx context.Context, job volumeJob, base *manifest.Manifest) error {
+	if _, err := os.Stat(job.image); err == nil {
+		return nil // raw image already present
+	}
+	zst := job.image + ".zst"
+	if _, err := os.Stat(zst); err != nil {
+		return fmt.Errorf("incremental base image %s not found (and no %s to rebuild it from); re-download the base or drop --base-manifest", job.image, zst)
+	}
+	if base.ImageSHA256 == "" {
+		return fmt.Errorf("base manifest has no verified image hash; cannot rebuild the raw base safely")
+	}
+	fmt.Fprintf(os.Stderr, "rebuilding raw base image from %s ...\n", filepath.Base(zst))
+	return img.DecompressImage(ctx, zst, job.image, base.ImageSHA256, base.LogicalSize)
+}
+
 // statePathFor decides where the resume journal lives.
 func statePathFor(job volumeJob) string {
 	if downloadFlags.stateDir != "" {
@@ -292,11 +335,17 @@ func sanitizeDeviceName(device string) string {
 
 // dryRun lists each snapshot's blocks and prints the plan plus a local
 // disk-space check.
-func dryRun(ctx context.Context, source ebsx.Source, jobs []volumeJob) error {
+func dryRun(ctx context.Context, source ebsx.Source, jobs []volumeJob, baseMan *manifest.Manifest) error {
 	var totalAlloc int64
 	var totalCost costEstimate
 	for _, job := range jobs {
 		lister := ebsx.NewLister(source, job.snapshotID, int32(downloadFlags.blockPageSize))
+		if baseMan != nil {
+			if err := dryRunDelta(ctx, lister, job, baseMan, &totalAlloc, &totalCost); err != nil {
+				return err
+			}
+			continue
+		}
 		info, err := lister.ListAll(ctx)
 		if err != nil {
 			return fmt.Errorf("%s: %w", job.snapshotID, err)
@@ -339,6 +388,46 @@ func dryRun(ctx context.Context, source ebsx.Source, jobs []volumeJob) error {
 	fmt.Println("cost notes:   happy-path requests only (retries/token refreshes excluded); allocated bytes are")
 	fmt.Println("              an upper-bound estimate; verify current EBS Direct API pricing")
 	fmt.Println("no data transferred (--dry-run)")
+	return nil
+}
+
+// dryRunDelta prints the incremental plan for one job.
+func dryRunDelta(ctx context.Context, lister *ebsx.Lister, job volumeJob, base *manifest.Manifest, totalAlloc *int64, totalCost *costEstimate) error {
+	changed, volumeGiB, blockSize, err := lister.ListChangedAll(ctx, base.SnapshotID)
+	if err != nil {
+		return fmt.Errorf("%s: %w", job.snapshotID, err)
+	}
+	var fetched, zeroed, newBlocks int
+	baseIdx := base.IndexMap()
+	for _, c := range changed {
+		if c.SecondToken == "" {
+			zeroed++
+			continue
+		}
+		fetched++
+		if _, ok := baseIdx[c.Index]; !ok {
+			newBlocks++
+		}
+	}
+	bytes := int64(fetched) * blockSize
+	cost := estimateCost(2, fetched, bytes, downloadFlags.egressPerGB)
+	*totalAlloc += bytes
+	totalCost.ListRequests += cost.ListRequests
+	totalCost.GetRequests += cost.GetRequests
+	totalCost.RequestCostUSD += cost.RequestCostUSD
+	totalCost.EgressGB += cost.EgressGB
+	totalCost.EgressCostUSD += cost.EgressCostUSD
+	totalCost.TotalUSD += cost.TotalUSD
+
+	fmt.Printf("%s (device %s):\n", job.snapshotID, job.device)
+	fmt.Printf("  incremental: from %s (%d GiB) to %d GiB\n", base.SnapshotID, base.VolumeSizeGiB, volumeGiB)
+	fmt.Printf("  changed:     %d blocks to fetch (%s, %d new), %d deallocated (zeroed)\n",
+		fetched, humanBytes(float64(bytes)), newBlocks, zeroed)
+	fmt.Printf("  unchanged:   %d blocks reused from the base image, not re-downloaded\n", base.BlockCount)
+	fmt.Printf("  output:      %s\n", job.image)
+	fmt.Printf("  compressed:  %s.zst\n", job.image)
+	fmt.Printf("  cost est:    %s (%s list + %s get requests%s)\n",
+		usd(cost.TotalUSD), humanCount(cost.ListRequests), humanCount(cost.GetRequests), egressNote(cost))
 	return nil
 }
 
@@ -413,6 +502,10 @@ func printResult(job volumeJob, res *dl.Result, noCompress bool) {
 	fmt.Printf("%s:\n", who)
 	fmt.Printf("  volume: %d GiB logical, %d allocated blocks (%s), block size %d KiB\n",
 		m.VolumeSizeGiB, m.BlockCount, humanBytes(float64(m.AllocatedBytes)), m.BlockSize/1024)
+	if res.DeltaFrom != "" {
+		fmt.Printf("  incremental from %s: %d changed blocks fetched, %d deallocated (zeroed), rest reused\n",
+			res.DeltaFrom, res.ChangedBlocks, res.ZeroedBlocks)
+	}
 	fmt.Printf("  blocks fetched this run: %d, resumed: %d, zero (kept sparse): %d\n",
 		res.NewBlocks, res.ResumedBlocks, res.ZeroBlocks)
 	fmt.Printf("  image sha256: %s  [verify PASS: %d/%d blocks]\n", res.ImageSHA256, m.BlockCount, m.BlockCount)

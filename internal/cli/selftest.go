@@ -48,6 +48,12 @@ type SelfTestResult struct {
 	Refetched    int64 // extra GetBlock calls caused by the simulated crash
 	CompressedMB float64
 	Duration     time.Duration
+	// Delta leg: changed blocks fetched incrementally, blocks reused
+	// from the base, and whether the delta image hash matched a full
+	// download's.
+	DeltaFetched int
+	DeltaReused  int
+	DeltaMatched bool
 }
 
 // RunSelfTest drives the full pipeline against an in-memory snapshot.
@@ -172,6 +178,13 @@ func RunSelfTest(dir string) (*SelfTestResult, error) {
 		return nil, fmt.Errorf("zero-block detection: got %d, expected %d", res.ZeroBlocks, expectedZero)
 	}
 
+	// Phase 4: incremental sync (full base, changed-block delta, hash
+	// comparison with a full download of the target).
+	delta := runDeltaSelfTest(ctx, dir)
+	if delta.err != nil {
+		return nil, delta.err
+	}
+
 	return &SelfTestResult{
 		VolumeGiB:    volumeGiB,
 		Blocks:       len(indices),
@@ -182,7 +195,113 @@ func RunSelfTest(dir string) (*SelfTestResult, error) {
 		Refetched:    fake.GetCalls() - int64(len(indices)),
 		CompressedMB: float64(res.CompressedSize) / (1 << 20),
 		Duration:     res.Duration,
+		DeltaFetched: delta.fetched,
+		DeltaReused:  delta.reused,
+		DeltaMatched: delta.matched,
 	}, nil
+}
+
+// deltaSelfTestOutcome carries the delta leg's result.
+type deltaSelfTestOutcome struct {
+	fetched int
+	reused  int
+	matched bool
+	err     error
+}
+
+// runDeltaSelfTest exercises the incremental path against a derived
+// fake: full base download, changed-block sync, then a hash comparison
+// against a full download of the target snapshot.
+func runDeltaSelfTest(ctx context.Context, dir string) deltaSelfTestOutcome {
+	const (
+		baseID = "snap-selftestbase001"
+		nextID = "snap-selftestnext002"
+		volGiB = 1
+		bs     = 512 * 1024
+		count  = 90
+	)
+	final := int64(volGiB*(1<<30)/bs) - 1
+	indices := testutil.ScratchIndices(count, final)
+	base := testutil.NewFake(baseID, volGiB, bs, indices, bs)
+	next := base.Derive(nextID, volGiB)
+
+	// Mutate: 6 modified, 3 removed, 5 added.
+	nextIndices := base.Indices()
+	for i := 0; i < 6; i++ {
+		idx := nextIndices[(i*9+1)%len(nextIndices)]
+		if content := next.Data(idx); content != nil {
+			content[len(content)-1] ^= 0x5A
+			next.UpdateBlockContent(idx, content)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		next.RemoveBlock(nextIndices[(i*13+7)%len(nextIndices)])
+	}
+	allocated := map[int64]bool{}
+	for _, idx := range indices {
+		allocated[idx] = true
+	}
+	for added, k := 0, int64(0); added < 5 && k < final; k++ {
+		idx := final - 1 - k*11
+		if idx < 0 || allocated[idx] {
+			continue
+		}
+		next.AddBlock(idx, bs)
+		added++
+	}
+
+	paths := func(id string) (image, mani, state string) {
+		image = filepath.Join(dir, id+".img")
+		return image, filepath.Join(dir, id+".manifest.json"), filepath.Join(dir, id+".state.jsonl")
+	}
+
+	// Full base download (raw kept by skipping compression).
+	baseImg, baseMan, baseState := paths(baseID)
+	baseRes, err := dl.New(base, dl.Options{Concurrency: 8}).Run(ctx, &dl.Request{
+		SnapshotID: baseID, ImagePath: baseImg, ManifestPath: baseMan, StatePath: baseState,
+	})
+	if err != nil {
+		return deltaSelfTestOutcome{err: fmt.Errorf("delta selftest base download: %w", err)}
+	}
+
+	// Delta sync on top of the base image.
+	_, nextMan, nextState := paths(nextID)
+	deltaRes, err := dl.New(next, dl.Options{Concurrency: 8}).Run(ctx, &dl.Request{
+		SnapshotID:   nextID,
+		ImagePath:    baseImg, // incremental: build on the base image
+		ManifestPath: nextMan,
+		StatePath:    nextState,
+		BaseManifest: baseRes.Manifest,
+	})
+	if err != nil {
+		return deltaSelfTestOutcome{err: fmt.Errorf("delta selftest sync: %w", err)}
+	}
+
+	// Snapshot the delta's fetch count before the reference download
+	// reuses the same fake.
+	deltaFetches := next.GetCalls()
+
+	// Full download of the target elsewhere must produce the same hash.
+	fullImg, fullMan, fullState := paths("full-" + nextID)
+	fullRes, err := dl.New(next, dl.Options{Concurrency: 8}).Run(ctx, &dl.Request{
+		SnapshotID: nextID, ImagePath: fullImg, ManifestPath: fullMan, StatePath: fullState,
+	})
+	if err != nil {
+		return deltaSelfTestOutcome{err: fmt.Errorf("delta selftest full reference: %w", err)}
+	}
+	if deltaRes.ImageSHA256 != fullRes.ImageSHA256 {
+		return deltaSelfTestOutcome{err: fmt.Errorf("delta selftest: delta hash %s != full hash %s",
+			deltaRes.ImageSHA256, fullRes.ImageSHA256)}
+	}
+	if deltaFetches != int64(deltaRes.ChangedBlocks) {
+		return deltaSelfTestOutcome{err: fmt.Errorf("delta selftest: %d target fetches != %d changed blocks",
+			deltaFetches, deltaRes.ChangedBlocks)}
+	}
+	return deltaSelfTestOutcome{
+		fetched: deltaRes.ChangedBlocks,
+		reused:  baseRes.Manifest.BlockCount - deltaRes.ZeroedBlocks,
+		matched: true,
+	}
 }
 
 func printSelfTestSummary(r *SelfTestResult) {
@@ -194,4 +313,13 @@ func printSelfTestSummary(r *SelfTestResult) {
 	fmt.Printf("  all-zero blocks kept as holes: %d\n", r.ZeroBlocks)
 	fmt.Printf("  block checksums: verified; whole-image sha256 recorded\n")
 	fmt.Printf("  compressed output: %.1f MiB, restore test PASS\n", r.CompressedMB)
+	fmt.Printf("  incremental sync: %d changed blocks fetched, %d reused from base; delta hash %s\n",
+		r.DeltaFetched, r.DeltaReused, matchLabel(r.DeltaMatched))
+}
+
+func matchLabel(ok bool) string {
+	if ok {
+		return "matches full download"
+	}
+	return "MISMATCH"
 }

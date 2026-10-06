@@ -122,3 +122,46 @@ func readFullAt(f *os.File, buf []byte, off int64) (int, error) {
 	}
 	return total, nil
 }
+
+// VerifySample spot-checks a manifest against an image: the file size
+// must match exactly, then n evenly-strided allocated blocks are re-read
+// and checksummed (n <= 0 or n >= block count degrades to a full Verify).
+// Used to validate a base image before an incremental sync builds on it.
+func VerifySample(ctx context.Context, path string, m *manifest.Manifest, n int) error {
+	if n <= 0 || n >= len(m.Blocks) {
+		_, err := Verify(ctx, path, m, nil)
+		return err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if st.Size() != m.LogicalSize {
+		return fmt.Errorf("image size %d does not match manifest logical size %d", st.Size(), m.LogicalSize)
+	}
+	stride := len(m.Blocks) / n
+	full := make([]byte, m.BlockSize)
+	checked := 0
+	for i := 0; i < len(m.Blocks) && checked < n; i += stride {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		b := m.Blocks[i]
+		buf := full[:b.Length]
+		if _, err := readFullAt(f, buf, b.Offset); err != nil {
+			return fmt.Errorf("reading block at offset %d: %w", b.Offset, err)
+		}
+		sum := sha256.Sum256(buf)
+		if base64.StdEncoding.EncodeToString(sum[:]) != b.SHA256 {
+			return fmt.Errorf("block at offset %d (index %d): checksum mismatch: manifest %s, on disk %s",
+				b.Offset, b.Index, b.SHA256, base64.StdEncoding.EncodeToString(sum[:]))
+		}
+		checked++
+	}
+	return nil
+}

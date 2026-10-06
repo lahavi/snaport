@@ -66,6 +66,7 @@ Credentials and region resolve through the standard AWS chain (env vars,
 | `--dry-run` | off | list blocks; estimate sizes, AWS cost and free space; transfer nothing |
 | `--root-only` | off | AMI mode: only the root volume |
 | `--wait` | off | wait up to e.g. `--wait 15m` for pending snapshots to complete before downloading |
+| `--base-manifest` | off | incremental sync: fetch only blocks changed since this completed base manifest (snapshot mode) |
 | `--state-dir` | alongside output | where resume journals live |
 | `--egress-per-gb` | 0.09 | USD/GB internet egress rate used in `--dry-run` cost estimates (0 = ignore egress, e.g. inside AWS) |
 
@@ -131,6 +132,34 @@ needs help to look inside:
   or ImDisk to get a drive letter, or convert to VHD and attach via
   Disk Management.
 
+## Incremental re-sync
+
+For recurring backups of the same volume, `--base-manifest` downloads
+only what changed. Give it the completed manifest of a previously
+downloaded snapshot **in the same volume lineage** (snapshots of the
+same EBS volume) and the same `-o` image path:
+
+```
+snaport download snap-B --base-manifest snap-A.manifest.json -o snap-A.img
+```
+
+- `ListChangedBlocks` diffs the snapshots server-side; changed blocks
+  are fetched, unchanged blocks are reused from the base image, and
+  blocks deallocated in the new snapshot are returned to sparse holes.
+- The base image is spot-checked (32 evenly-strided block checksums)
+  before anything builds on it; a mismatch aborts with guidance. If the
+  raw base was deleted after verified compression, it is rebuilt
+  (hash-checked) from the `.img.zst` automatically.
+- Interrupted deltas resume: the journal records the lineage base, and
+  a partially-migrated image continues rather than restarting.
+- Volume growth is supported (the image is extended); shrink is
+  rejected, as EBS volumes cannot shrink.
+- The final verification and (optional) compression stages are exactly
+  the same as a full download, so a delta result is bit-for-bit
+  identical to one - the test suite and `snaport selftest` both assert
+  this. `--dry-run` prints the delta plan (blocks to fetch, blocks
+  zeroed, reused count, cost).
+
 ## Cost estimation
 
 The EBS Direct APIs bill per request (about $0.003 per 1,000 requests each
@@ -182,7 +211,7 @@ Minimal read-only policy for plain snapshots:
     {
       "Sid": "SnaportReadBlocks",
       "Effect": "Allow",
-      "Action": ["ebs:ListSnapshotBlocks", "ebs:GetSnapshotBlock"],
+      "Action": ["ebs:ListSnapshotBlocks", "ebs:GetSnapshotBlock", "ebs:ListChangedBlocks"],
       "Resource": "arn:aws:ec2:*::snapshot/*"
     }
   ]
@@ -252,8 +281,6 @@ ramps back up when calm. If you consistently throttle, lower
 
 ## Limitations / future work
 
-- v1 downloads full snapshots; incremental re-sync via
-  `ListChangedBlocks` is future work.
 - Compression is a whole-image zstd stream (universally decodable); a
   seekable/chunked archive would allow random access without full
   decompression.

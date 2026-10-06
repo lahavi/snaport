@@ -28,6 +28,28 @@ func markSparse(f *os.File) error {
 	return nil
 }
 
+// zeroRange wipes [offset, offset+length) via FSCTL_SET_ZERO_DATA: the
+// region reads as zeros and, in a sparse file, is deallocated back to a
+// hole.
+func zeroRange(f *os.File, offset, length int64) error {
+	info := windows.FileZeroDataInformation{
+		FileOffset:      offset,
+		BeyondFinalZero: offset + length,
+	}
+	var bytesReturned uint32
+	err := windows.DeviceIoControl(
+		windows.Handle(f.Fd()),
+		windows.FSCTL_SET_ZERO_DATA,
+		(*byte)(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)),
+		nil, 0,
+		&bytesReturned, nil,
+	)
+	if err != nil {
+		return fmt.Errorf("FSCTL_SET_ZERO_DATA: %w", err)
+	}
+	return nil
+}
+
 // EnableNTFSCompression turns on NTFS transparent compression for the
 // file (best effort). On non-NTFS volumes or without privileges this
 // fails and is reported as a warning by the caller.

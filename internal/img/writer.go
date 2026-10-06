@@ -62,6 +62,23 @@ func (w *Writer) WriteBlock(offset int64, data []byte) error {
 	return nil
 }
 
+// ZeroRange erases [offset, offset+length): any previous data there
+// becomes zeros, and on sparse-aware filesystems the range returns to a
+// hole. Used by incremental syncs for blocks deallocated between
+// snapshots. It may be called concurrently with other writes.
+func (w *Writer) ZeroRange(offset, length int64) error {
+	if offset < 0 || length < 0 || offset+length > w.logical {
+		return fmt.Errorf("zero range [%d,%d) outside image bounds [0,%d)", offset, offset+length, w.logical)
+	}
+	if length == 0 {
+		return nil
+	}
+	if err := zeroRange(w.f, offset, length); err != nil {
+		return fmt.Errorf("zeroing [%d,%d): %w", offset, offset+length, err)
+	}
+	return nil
+}
+
 // Sync flushes written data to durable storage.
 func (w *Writer) Sync() error { return w.f.Sync() }
 

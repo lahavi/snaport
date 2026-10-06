@@ -29,6 +29,26 @@ type ListPage struct {
 	NextToken string
 }
 
+// ChangedBlockRef is one block that differs between two snapshots of the
+// same volume lineage.
+type ChangedBlockRef struct {
+	Index int64
+	// SecondToken fetches the block's data from the second (newer)
+	// snapshot. Empty when the block is deallocated there, meaning the
+	// region reads as zeros in the newer snapshot.
+	SecondToken string
+}
+
+// ChangedPage is one page of ListChangedBlocks results. Geometry fields
+// describe the second (newer) snapshot.
+type ChangedPage struct {
+	Changed    []ChangedBlockRef
+	VolumeGiB  int64
+	BlockSize  int64
+	ExpiryTime time.Time
+	NextToken  string
+}
+
 // BlockData is one downloaded block with its verified checksum.
 type BlockData struct {
 	Data   []byte
@@ -61,4 +81,9 @@ type Source interface {
 	// GetBlock downloads one block by index using a block token from a
 	// listing. It verifies the block checksum before returning.
 	GetBlock(ctx context.Context, snapshotID string, index int64, token string) (BlockData, error)
+
+	// ListChangedPage lists one page of blocks that differ between two
+	// snapshots of the same volume lineage. secondID is the newer
+	// snapshot whose state is being produced.
+	ListChangedPage(ctx context.Context, firstID, secondID, nextToken string, startingIndex int64, maxResults int32) (ChangedPage, error)
 }

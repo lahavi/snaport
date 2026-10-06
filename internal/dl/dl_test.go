@@ -15,7 +15,7 @@ import (
 func TestJournalRoundtripAndClear(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "j.jsonl")
 
-	j, err := OpenJournal(path, "snap-1", 10)
+	j, err := OpenJournal(path, "snap-1", 10, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +28,7 @@ func TestJournalRoundtripAndClear(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	j2, err := OpenJournal(path, "snap-1", 10)
+	j2, err := OpenJournal(path, "snap-1", 10, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +41,7 @@ func TestJournalRoundtripAndClear(t *testing.T) {
 	}
 	j2.Close()
 
-	j3, err := OpenJournal(path, "snap-1", 10)
+	j3, err := OpenJournal(path, "snap-1", 10, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestJournalRoundtripAndClear(t *testing.T) {
 	j3.Close()
 
 	// Mismatched snapshot ID must fail.
-	if _, err := OpenJournal(path, "snap-2", 10); err == nil {
+	if _, err := OpenJournal(path, "snap-2", 10, ""); err == nil {
 		t.Fatal("expected mismatch error")
 	}
 }
@@ -60,7 +60,7 @@ func TestJournalTornTailIsIgnored(t *testing.T) {
 	// Crash-safety property: an entry torn by a crash mid-append must be
 	// ignored on replay, not corrupt the journal.
 	path := filepath.Join(t.TempDir(), "j2.jsonl")
-	j, err := OpenJournal(path, "snap-1", 5)
+	j, err := OpenJournal(path, "snap-1", 5, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestJournalTornTailIsIgnored(t *testing.T) {
 	f.WriteString(`{"o":1,"len":52`)
 	f.Close()
 
-	j2, err := OpenJournal(path, "snap-1", 5)
+	j2, err := OpenJournal(path, "snap-1", 5, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +239,7 @@ func TestManagerParanoidResumeRedownloadsCorruptBlocks(t *testing.T) {
 
 	// Simulate a "resume" state: rebuild a journal claiming all blocks
 	// done, but corrupt one block on disk.
-	j, err := OpenJournal(req.StatePath, req.SnapshotID, len(m.Blocks))
+	j, err := OpenJournal(req.StatePath, req.SnapshotID, len(m.Blocks), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +306,7 @@ func TestManagerCompressAndCleanup(t *testing.T) {
 func TestManagerForceDiscardsState(t *testing.T) {
 	fake, req := newTestEnv(t, 30)
 	// Seed a journal for a different block count to trigger mismatch.
-	j, err := OpenJournal(req.StatePath, req.SnapshotID, 999)
+	j, err := OpenJournal(req.StatePath, req.SnapshotID, 999, "")
 	if err == nil {
 		j.Close()
 	}
@@ -316,5 +316,244 @@ func TestManagerForceDiscardsState(t *testing.T) {
 	req.Force = true
 	if _, err := New(fake, Options{Concurrency: 4}).Run(context.Background(), req); err != nil {
 		t.Fatalf("force run failed: %v", err)
+	}
+}
+
+// newDeltaEnv builds a fake snapshot A plus a derived B with a known
+// change set: modified, removed, and added blocks. B's data matches A
+// except for those blocks, so a delta download must equal a full one.
+func newDeltaEnv(t *testing.T, blocks int) (a, b *testutil.FakeSnapshot, modified, removed, added []int64) {
+	t.Helper()
+	const (
+		volumeGiB = 1
+		blockSize = 512 * 1024
+	)
+	final := int64(volumeGiB*(1<<30)/blockSize) - 1
+	indices := testutil.ScratchIndices(int64(blocks), final)
+	a = testutil.NewFake("snap-base00000000001", volumeGiB, blockSize, indices, blockSize)
+	aIndices := a.Indices()
+	allocated := make(map[int64]bool, len(aIndices))
+	for _, idx := range aIndices {
+		allocated[idx] = true
+	}
+
+	b = a.Derive("snap-next00000000002", volumeGiB)
+	used := map[int64]bool{}
+
+	pick := func(stride, offset int) (int64, bool) {
+		for i := offset; i < len(aIndices); i += stride {
+			idx := aIndices[i]
+			if !used[idx] {
+				used[idx] = true
+				return idx, true
+			}
+		}
+		return 0, false
+	}
+
+	// Modify five existing blocks (flip the first byte).
+	for k := 0; k < 5; k++ {
+		idx, ok := pick(3, k)
+		if !ok {
+			break
+		}
+		content := b.Data(idx)
+		if content == nil {
+			content = a.Data(idx)
+		}
+		content[0] ^= 0xFF
+		b.UpdateBlockContent(idx, content)
+		modified = append(modified, idx)
+	}
+	// Remove three existing blocks.
+	for k := 0; k < 3; k++ {
+		idx, ok := pick(4, 1+2*k)
+		if !ok {
+			break
+		}
+		b.RemoveBlock(idx)
+		removed = append(removed, idx)
+	}
+	// Add four blocks in regions A never allocated.
+	for k := int64(0); len(added) < 4; k++ {
+		idx := final - 1 - k*7
+		if idx < 0 || allocated[idx] {
+			continue
+		}
+		b.AddBlock(idx, blockSize)
+		added = append(added, idx)
+	}
+	return a, b, modified, removed, added
+}
+
+// deltaPaths builds request paths for a snapshot id in dir.
+func deltaPaths(dir, snapshotID string) *Request {
+	image := filepath.Join(dir, snapshotID+".img")
+	return &Request{
+		SnapshotID:   snapshotID,
+		ImagePath:    image,
+		ManifestPath: filepath.Join(dir, snapshotID+".manifest.json"),
+		StatePath:    filepath.Join(dir, snapshotID+".state.jsonl"),
+	}
+}
+
+func TestManagerDeltaSyncMatchesFullDownload(t *testing.T) {
+	a, b, modified, removed, added := newDeltaEnv(t, 80)
+	dir := t.TempDir()
+
+	// Full download of the base.
+	baseReq := deltaPaths(dir, a.SnapshotID)
+	baseRes, err := New(a, Options{Concurrency: 4}).Run(context.Background(), baseReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Incremental download of B on top of A's image.
+	deltaReq := deltaPaths(dir, b.SnapshotID)
+	deltaReq.ImagePath = baseReq.ImagePath // delta builds on the base image
+	deltaReq.BaseManifest = baseRes.Manifest
+	deltaRes, err := New(b, Options{Concurrency: 4}).Run(context.Background(), deltaReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantChanged := len(modified) + len(added)
+	if deltaRes.DeltaFrom != a.SnapshotID ||
+		deltaRes.ChangedBlocks != wantChanged ||
+		deltaRes.ZeroedBlocks != len(removed) {
+		t.Fatalf("delta stats: from=%s changed=%d (want %d) zeroed=%d (want %d)",
+			deltaRes.DeltaFrom, deltaRes.ChangedBlocks, wantChanged, deltaRes.ZeroedBlocks, len(removed))
+	}
+
+	// Only the changed blocks may be fetched from B.
+	if got := b.GetCalls(); got != int64(wantChanged) {
+		t.Fatalf("B GetBlock calls = %d, want exactly %d", got, wantChanged)
+	}
+
+	// The delta manifest must list exactly B's allocated blocks.
+	bIndices := b.Indices()
+	if deltaRes.Manifest.BlockCount != len(bIndices) {
+		t.Fatalf("manifest blocks = %d, want %d", deltaRes.Manifest.BlockCount, len(bIndices))
+	}
+	for i, idx := range bIndices {
+		if deltaRes.Manifest.Blocks[i].Index != idx {
+			t.Fatalf("manifest block %d index %d, want %d", i, deltaRes.Manifest.Blocks[i].Index, idx)
+		}
+	}
+
+	// Full download of B elsewhere must produce a byte-identical image.
+	fullReq := deltaPaths(t.TempDir(), b.SnapshotID)
+	fullRes, err := New(b, Options{Concurrency: 4}).Run(context.Background(), fullReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fullRes.ImageSHA256 != deltaRes.ImageSHA256 {
+		t.Fatalf("delta image hash %s != full image hash %s", deltaRes.ImageSHA256, fullRes.ImageSHA256)
+	}
+	if b.GetCalls() != int64(wantChanged)+int64(len(bIndices)) {
+		t.Fatalf("total B calls after full download = %d", b.GetCalls())
+	}
+}
+
+func TestManagerDeltaSyncResume(t *testing.T) {
+	a, b, _, _, _ := newDeltaEnv(t, 60)
+	dir := t.TempDir()
+
+	baseReq := deltaPaths(dir, a.SnapshotID)
+	baseRes, err := New(a, Options{Concurrency: 4}).Run(context.Background(), baseReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deltaReq := deltaPaths(dir, b.SnapshotID)
+	deltaReq.ImagePath = baseReq.ImagePath
+	deltaReq.BaseManifest = baseRes.Manifest
+
+	// Interrupt mid-delta.
+	ctx, cancel := context.WithCancel(context.Background())
+	var once sync.Once
+	opts := Options{Concurrency: 4, Progress: func(u Update) {
+		if u.Phase == PhaseDownload && u.BlocksDone >= 3 {
+			once.Do(cancel)
+		}
+	}}
+	if _, err := New(b, opts).Run(ctx, deltaReq); err == nil {
+		t.Fatal("expected cancellation error")
+	}
+	cancel()
+
+	// Resume to completion.
+	res, err := New(b, Options{Concurrency: 4, ParanoidResume: true}).Run(context.Background(), deltaReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ImageSHA256 == "" || res.DeltaFrom != a.SnapshotID {
+		t.Fatalf("unexpected resumed delta result: %+v", res)
+	}
+}
+
+func TestManagerDeltaRejectsCorruptBase(t *testing.T) {
+	a, b, _, _, _ := newDeltaEnv(t, 40)
+	dir := t.TempDir()
+
+	baseReq := deltaPaths(dir, a.SnapshotID)
+	baseRes, err := New(a, Options{Concurrency: 4}).Run(context.Background(), baseReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Corrupt one byte of the base image; the sampled verification must
+	// refuse to build the delta on it.
+	f, err := os.OpenFile(baseReq.ImagePath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	victim := baseRes.Manifest.Blocks[0] // stride sampling always checks ordinal 0
+	f.WriteAt([]byte{0xAA}, victim.Offset+7)
+	f.Close()
+
+	deltaReq := deltaPaths(dir, b.SnapshotID)
+	deltaReq.ImagePath = baseReq.ImagePath
+	deltaReq.BaseManifest = baseRes.Manifest
+	if _, err := New(b, Options{Concurrency: 4, BaseVerifySample: 8}).Run(context.Background(), deltaReq); err == nil {
+		t.Fatal("expected base verification failure")
+	}
+}
+
+func TestManagerDeltaGrowVolume(t *testing.T) {
+	a, _, _, _, _ := newDeltaEnv(t, 30)
+	// Derived with a larger volume and one new block beyond the old end.
+	const grownGiB = 2
+	const blockSize = 512 * 1024
+	b := a.Derive("snap-grown0000000003", grownGiB)
+	newIdx := int64(1)*(grownGiB*(1<<30)/blockSize) - 5 // beyond A's last index
+	b.AddBlock(newIdx, blockSize)
+
+	dir := t.TempDir()
+	baseReq := deltaPaths(dir, a.SnapshotID)
+	baseRes, err := New(a, Options{Concurrency: 4}).Run(context.Background(), baseReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deltaReq := deltaPaths(dir, b.SnapshotID)
+	deltaReq.ImagePath = baseReq.ImagePath
+	deltaReq.BaseManifest = baseRes.Manifest
+	res, err := New(b, Options{Concurrency: 4}).Run(context.Background(), deltaReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Manifest.LogicalSize != grownGiB*(1<<30) {
+		t.Fatalf("logical size %d, want grown %d", res.Manifest.LogicalSize, grownGiB*(1<<30))
+	}
+	// The new block must be present and verified.
+	found := false
+	for _, blk := range res.Manifest.Blocks {
+		if blk.Index == newIdx {
+			found = blk.SHA256 != ""
+		}
+	}
+	if !found {
+		t.Fatal("new block beyond the old volume end missing from delta manifest")
 	}
 }
