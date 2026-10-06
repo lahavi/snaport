@@ -65,6 +65,7 @@ Credentials and region resolve through the standard AWS chain (env vars,
 | `--force` | off | discard manifest/journal/image and restart |
 | `--dry-run` | off | list blocks; estimate sizes, AWS cost and free space; transfer nothing |
 | `--root-only` | off | AMI mode: only the root volume |
+| `--wait` | off | wait up to e.g. `--wait 15m` for pending snapshots to complete before downloading |
 | `--state-dir` | alongside output | where resume journals live |
 | `--egress-per-gb` | 0.09 | USD/GB internet egress rate used in `--dry-run` cost estimates (0 = ignore egress, e.g. inside AWS) |
 
@@ -174,6 +175,23 @@ Add for AMI downloads:
       "Resource": "*"
     }
 ```
+
+Optional but recommended: `ec2:DescribeSnapshots` lets snaport detect
+pending/erroring snapshots up front (without it, snaport proceeds and
+surfaces the raw API error instead):
+
+```json
+    {
+      "Sid": "SnaportCheckState",
+      "Effect": "Allow",
+      "Action": "ec2:DescribeSnapshots",
+      "Resource": "*"
+    }
+```
+
+Note that the EBS Direct read APIs only serve **completed** snapshots;
+downloading one that is still `pending` fails fast with a clear message,
+or waits with `--wait 15m`.
 
 For **encrypted** snapshots the caller also needs `kms:Decrypt` on the
 snapshot's KMS key (the EBS Direct APIs return decrypted block data):

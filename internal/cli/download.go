@@ -35,6 +35,7 @@ var downloadFlags struct {
 	rootOnly       bool
 	quiet          bool
 	egressPerGB    float64
+	wait           time.Duration
 }
 
 var downloadCmd = &cobra.Command{
@@ -67,6 +68,7 @@ func init() {
 	f.IntVar(&downloadFlags.blockPageSize, "block-pagesize", int(ebsx.DefaultListPageSize), "MaxResults per ListSnapshotBlocks call")
 	f.IntVar(&downloadFlags.maxAttempts, "max-attempts", 5, "fetch attempts per block before failing")
 	f.BoolVar(&downloadFlags.rootOnly, "root-only", false, "AMI: download only the root volume")
+	f.DurationVar(&downloadFlags.wait, "wait", 0, "wait up to this duration for pending snapshots to complete, e.g. --wait 15m (default: fail fast)")
 	f.BoolVar(&downloadFlags.quiet, "quiet", false, "suppress the progress display")
 	f.Float64Var(&downloadFlags.egressPerGB, "egress-per-gb", 0.09, "USD per GB of internet data-transfer-out used in --dry-run cost estimates (set 0 to ignore egress, e.g. when running inside AWS)")
 }
@@ -116,6 +118,16 @@ func runDownload(cmd *cobra.Command, args []string) error {
 		}
 	default:
 		return fmt.Errorf("unrecognized target %q: expected a snap-... or ami-... ID", target)
+	}
+
+	// The EBS Direct read APIs only serve completed snapshots; fail fast
+	// (or wait) on pending ones instead of surfacing a raw API error.
+	ids := make([]string, 0, len(jobs))
+	for _, j := range jobs {
+		ids = append(ids, j.snapshotID)
+	}
+	if err := ensureSnapshotsReady(ctx, ec2Client, ids, downloadFlags.wait); err != nil {
+		return err
 	}
 
 	if downloadFlags.dryRun {
