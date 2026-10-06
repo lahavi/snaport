@@ -4,7 +4,7 @@ rem browsed from Windows Explorer via \\wsl.localhost\<distro>\<mount>.
 rem Handles GPT/MBR partitioned images (mounts partition 1).
 rem
 rem Usage:   mount-image.cmd C:\path\to\image.img [wsl-mount-point]
-rem Example: mount-image.cmd C:\dev\snaport\snap-0b4d0ed03fd9b7795.img
+rem Example: mount-image.cmd C:\dev\snaport\snap-0123456789abcdef0123456789abcdef.img
 rem
 rem Unmount when done:
 rem   wsl -u root umount /mnt/snaport
@@ -13,7 +13,7 @@ rem   wsl -u root losetup -D
 setlocal EnableExtensions
 if "%~1"=="" (
   echo Usage: mount-image.cmd ^<path\to\image.img^> [wsl-mount-point]
-  echo Example: mount-image.cmd C:\dev\snaport\snap-0b4d0ed03fd9b7795.img
+  echo Example: mount-image.cmd C:\dev\snaport\snap-0123456789abcdef0123456789abcdef.img
   exit /b 1
 )
 
