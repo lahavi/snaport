@@ -21,6 +21,9 @@ type SnapshotInfo struct {
 	VolumeGiB  int64
 	BlockSize  int64
 	Blocks     []BlockRef // sorted by index
+	// Pages is the number of ListSnapshotBlocks calls ListAll made
+	// (token-refresh re-lists excluded). Used for cost estimation.
+	Pages int
 }
 
 // AllocatedBlockCount returns the number of allocated blocks.
@@ -102,6 +105,7 @@ func (l *Lister) ListAll(ctx context.Context) (*SnapshotInfo, error) {
 		nextToken string
 		volumeGiB int64
 		blockSize int64
+		pages     int
 	)
 	for page := 0; ; page++ {
 		if err := ctx.Err(); err != nil {
@@ -111,6 +115,7 @@ func (l *Lister) ListAll(ctx context.Context) (*SnapshotInfo, error) {
 		if err != nil {
 			return nil, fmt.Errorf("listing page %d: %w", page+1, err)
 		}
+		pages++
 		if page == 0 {
 			volumeGiB, blockSize = p.VolumeGiB, p.BlockSize
 		} else if p.VolumeGiB != volumeGiB || p.BlockSize != blockSize {
@@ -135,7 +140,7 @@ func (l *Lister) ListAll(ctx context.Context) (*SnapshotInfo, error) {
 		return nil, fmt.Errorf("snapshot %s listing returned invalid geometry: volume %d GiB, block size %d",
 			l.snapshotID, volumeGiB, blockSize)
 	}
-	return &SnapshotInfo{SnapshotID: l.snapshotID, VolumeGiB: volumeGiB, BlockSize: blockSize, Blocks: blocks}, nil
+	return &SnapshotInfo{SnapshotID: l.snapshotID, VolumeGiB: volumeGiB, BlockSize: blockSize, Blocks: blocks, Pages: pages}, nil
 }
 
 // listWithRetry wraps ListPage with backoff for transient errors.

@@ -42,7 +42,7 @@ go build -ldflags "-X snaport/internal/cli.Version=0.1.0" -o snaport.exe ./cmd/s
 ```
 snaport download snap-0123456789abcdef0                 # one snapshot -> ./snap-....img(.zst)
 snaport download ami-0123456789abcdef0 -o D:\backups    # all EBS volumes -> D:\backups\ami-...\*.img.zst
-snaport download snap-0123456789abcdef0 --dry-run       # plan only: sizes, blocks, disk headroom
+snaport download snap-0123456789abcdef0 --dry-run       # plan only: sizes, blocks, cost, disk headroom
 snaport verify D:\backups\ami-0123456789abcdef0         # re-verify a finished download
 snaport selftest                                         # offline end-to-end test, no AWS needed
 ```
@@ -63,9 +63,10 @@ Credentials and region resolve through the standard AWS chain (env vars,
 | `--ntfs-compress` | off | also apply transparent NTFS compression to the raw image |
 | `--paranoid-resume` | off | spot-check already-downloaded blocks against checksums when resuming |
 | `--force` | off | discard manifest/journal/image and restart |
-| `--dry-run` | off | list blocks, estimate sizes and check free space, transfer nothing |
+| `--dry-run` | off | list blocks; estimate sizes, AWS cost and free space; transfer nothing |
 | `--root-only` | off | AMI mode: only the root volume |
 | `--state-dir` | alongside output | where resume journals live |
+| `--egress-per-gb` | 0.09 | USD/GB internet egress rate used in `--dry-run` cost estimates (0 = ignore egress, e.g. inside AWS) |
 
 ## How it works
 
@@ -102,8 +103,28 @@ For a 500 GiB snapshot with 40 GiB of allocated blocks:
 | Compress + verify peak | ~60-70 GiB (raw + `.zst`) |
 | Final (default) | just the `.zst` (~20-30 GiB) |
 
-`--dry-run` prints the allocated-block estimate and your free space before
-anything is transferred.
+`--dry-run` prints the allocated-block estimate, the projected AWS cost
+and your free space before anything is transferred.
+
+## Cost estimation
+
+The EBS Direct APIs bill per request (about $0.003 per 1,000 requests each
+for `ListSnapshotBlocks` and `GetSnapshotBlock`), and downloading to a
+machine outside AWS adds internet data-transfer-out charges for the
+allocated bytes. `--dry-run` prints an itemized estimate:
+
+```
+  cost est:    $4.08 (2 list + 81,920 get requests; egress 40.0 GB @ $0.09/GB = $3.60)
+```
+
+The estimate counts happy-path requests only — one `GetSnapshotBlock` per
+allocated block plus the listing pages — so throttled retries and
+token-refresh re-lists add marginally. Allocated bytes are an upper-bound
+estimate (the listing exposes indexes, not lengths). Egress uses
+`--egress-per-gb` (default $0.09/GB, roughly the us-east-1 internet-out
+rate); set it to your region's rate, or `0` when running inside AWS or
+through a VPC endpoint where egress is free. Verify current pricing at
+<https://aws.amazon.com/ebs/pricing/>.
 
 ## Resume semantics
 

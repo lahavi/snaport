@@ -34,6 +34,7 @@ var downloadFlags struct {
 	maxAttempts    int
 	rootOnly       bool
 	quiet          bool
+	egressPerGB    float64
 }
 
 var downloadCmd = &cobra.Command{
@@ -67,6 +68,7 @@ func init() {
 	f.IntVar(&downloadFlags.maxAttempts, "max-attempts", 5, "fetch attempts per block before failing")
 	f.BoolVar(&downloadFlags.rootOnly, "root-only", false, "AMI: download only the root volume")
 	f.BoolVar(&downloadFlags.quiet, "quiet", false, "suppress the progress display")
+	f.Float64Var(&downloadFlags.egressPerGB, "egress-per-gb", 0.09, "USD per GB of internet data-transfer-out used in --dry-run cost estimates (set 0 to ignore egress, e.g. when running inside AWS)")
 }
 
 // volumeJob is one snapshot to download.
@@ -280,6 +282,7 @@ func sanitizeDeviceName(device string) string {
 // disk-space check.
 func dryRun(ctx context.Context, source ebsx.Source, jobs []volumeJob) error {
 	var totalAlloc int64
+	var totalCost costEstimate
 	for _, job := range jobs {
 		lister := ebsx.NewLister(source, job.snapshotID, int32(downloadFlags.blockPageSize))
 		info, err := lister.ListAll(ctx)
@@ -287,14 +290,24 @@ func dryRun(ctx context.Context, source ebsx.Source, jobs []volumeJob) error {
 			return fmt.Errorf("%s: %w", job.snapshotID, err)
 		}
 		logical := info.VolumeGiB * manifest.GiB
+		allocated := int64(info.AllocatedBlockCount()) * info.BlockSize
+		cost := estimateCost(info.Pages, info.AllocatedBlockCount(), allocated, downloadFlags.egressPerGB)
+		totalAlloc += allocated
+		totalCost.ListRequests += cost.ListRequests
+		totalCost.GetRequests += cost.GetRequests
+		totalCost.RequestCostUSD += cost.RequestCostUSD
+		totalCost.EgressGB += cost.EgressGB
+		totalCost.EgressCostUSD += cost.EgressCostUSD
+		totalCost.TotalUSD += cost.TotalUSD
 		fmt.Printf("%s (device %s):\n", job.snapshotID, job.device)
 		fmt.Printf("  volume:      %d GiB logical (%s), block size %d KiB\n",
 			info.VolumeGiB, humanBytes(float64(logical)), info.BlockSize/1024)
 		fmt.Printf("  allocated:   %d blocks; assuming full blocks: %s on disk\n",
-			info.AllocatedBlockCount(), humanBytes(float64(info.AllocatedBlockCount())*float64(info.BlockSize)))
+			info.AllocatedBlockCount(), humanBytes(float64(allocated)))
 		fmt.Printf("  output:      %s\n", job.image)
 		fmt.Printf("  compressed:  %s.zst\n", job.image)
-		totalAlloc += int64(info.AllocatedBlockCount()) * info.BlockSize
+		fmt.Printf("  cost est:    %s (%s list + %s get requests%s)\n",
+			usd(cost.TotalUSD), humanCount(cost.ListRequests), humanCount(cost.GetRequests), egressNote(cost))
 	}
 	fmt.Printf("\nplan: up to %s of sparse disk during download, plus the compressed output\n",
 		humanBytes(float64(totalAlloc)))
@@ -307,8 +320,36 @@ func dryRun(ctx context.Context, source ebsx.Source, jobs []volumeJob) error {
 			}
 		}
 	}
+	if len(jobs) > 1 {
+		fmt.Printf("\ntotal cost estimate: %s (%s list + %s get requests%s)\n",
+			usd(totalCost.TotalUSD), humanCount(totalCost.ListRequests), humanCount(totalCost.GetRequests), egressNote(totalCost))
+	}
+	fmt.Println("cost notes:   happy-path requests only (retries/token refreshes excluded); allocated bytes are")
+	fmt.Println("              an upper-bound estimate; verify current EBS Direct API pricing")
 	fmt.Println("no data transferred (--dry-run)")
 	return nil
+}
+
+// egressNote describes the data-transfer component, if priced in.
+func egressNote(c costEstimate) string {
+	if c.EgressCostUSD == 0 {
+		return ""
+	}
+	return fmt.Sprintf("; egress %.1f GB @ %s/GB = %s", c.EgressGB,
+		usd(downloadFlags.egressPerGB), usd(c.EgressCostUSD))
+}
+
+// humanCount renders a request count with a thousands separator.
+func humanCount(v int64) string {
+	s := fmt.Sprintf("%d", v)
+	var b []byte
+	for i := 0; i < len(s); i++ {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			b = append(b, ',')
+		}
+		b = append(b, s[i])
+	}
+	return string(b)
 }
 
 // volumeError enriches failures with actionable context.
