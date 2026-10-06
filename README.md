@@ -107,6 +107,30 @@ For a 500 GiB snapshot with 40 GiB of allocated blocks:
 `--dry-run` prints the allocated-block estimate, the projected AWS cost
 and your free space before anything is transferred.
 
+## Browsing a downloaded image
+
+Downloaded images are raw disk images (GPT/MBR partitioned), so Windows
+needs help to look inside:
+
+- **Linux filesystems (ext4/XFS - typical EC2 root volumes)** - use WSL2:
+
+  ```
+  tools\mount-image.cmd C:\path\to\snap-xxxx.img
+  ```
+
+  It attaches a loop device, mounts partition 1 **read-only** (with an
+  XFS `norecovery` fallback for volumes snapshotted while mounted) and
+  prints the Explorer path, normally
+  `\\wsl.localhost\Ubuntu/mnt/snaport`. The mount disappears when the
+  WSL VM stops; re-run the script to restore it. Unmount with
+  `wsl -u root umount /mnt/snaport && wsl -u root losetup -D`.
+  ext4-only images can also be browsed directly in 7-Zip (Open archive),
+  but 7-Zip does not understand XFS.
+
+- **NTFS/Windows volumes** - mount with [OSFMount](https://www.osforensics.com/tools/mount-disk-images.html)
+  or ImDisk to get a drive letter, or convert to VHD and attach via
+  Disk Management.
+
 ## Cost estimation
 
 The EBS Direct APIs bill per request (about $0.003 per 1,000 requests each
