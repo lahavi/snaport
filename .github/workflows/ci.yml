@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Check formatting
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "files needing gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Race tests
+        # The race detector needs cgo; gcc is available on Linux runners.
+        if: matrix.os == 'ubuntu-latest'
+        run: go test -race ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Offline selftest
+        # Exercises the real sparse-file path per OS: FSCTL_SET_SPARSE on
+        # Windows, natural holes on Linux.
+        run: go run ./cmd/snaport selftest

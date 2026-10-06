@@ -1,0 +1,49 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build and package
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          build() {
+            local goos="$1" goarch="$2" name="$3" bin="$4"
+            mkdir -p "dist/snaport-${VERSION}-${name}"
+            cp README.md LICENSE "dist/snaport-${VERSION}-${name}/"
+            GOOS="$goos" GOARCH="$goarch" go build -trimpath \
+              -ldflags "-s -w -X snaport/internal/cli.Version=${VERSION}" \
+              -o "dist/snaport-${VERSION}-${name}/${bin}" ./cmd/snaport
+          }
+          build windows amd64 windows-amd64 snaport.exe
+          build linux   amd64 linux-amd64   snaport
+          build linux   arm64 linux-arm64   snaport
+          cd dist
+          zip -r "snaport-${VERSION}-windows-amd64.zip" "snaport-${VERSION}-windows-amd64"
+          tar czf "snaport-${VERSION}-linux-amd64.tar.gz" "snaport-${VERSION}-linux-amd64"
+          tar czf "snaport-${VERSION}-linux-arm64.tar.gz" "snaport-${VERSION}-linux-arm64"
+          shasum -a 256 *.zip *.tar.gz > checksums.txt
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/checksums.txt
+          generate_release_notes: true
