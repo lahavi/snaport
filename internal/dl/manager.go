@@ -459,14 +459,14 @@ func (m *Manager) download(ctx context.Context, req *Request, man *manifest.Mani
 				stats.NewBlocks++
 				bytesNow += int64(len(bd.Data))
 				done := stats.NewBlocks
-				bd.Data = nil
+				shownBytes := bytesNow
 				cntMu.Unlock()
 
 				m.progress(Update{
 					Phase:       PhaseDownload,
 					BlocksDone:  statsOffset + done,
 					BlocksTotal: man.BlockCount,
-					BytesDone:   bytesNow,
+					BytesDone:   shownBytes,
 					BytesTotal:  estTotal,
 					Concurrency: limiter.Current(),
 				})
