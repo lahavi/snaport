@@ -8,6 +8,7 @@ dist/
 *.img
 *.img.zst
 *.state.json
+*.manifest.json
 *.test
 testdata/output/
 
