@@ -82,6 +82,10 @@ type Request struct {
 	// image must already be at ImagePath. Only blocks that changed
 	// between the base and SnapshotID are fetched.
 	BaseManifest *manifest.Manifest
+	// Stream switches to the one-shot streaming pipeline: blocks are
+	// compressed chunk-by-chunk directly into an .img.szc container and
+	// the raw image is never materialized. No resume, no delta.
+	Stream bool
 }
 
 // Result summarizes a completed run.
@@ -101,6 +105,9 @@ type Result struct {
 	// ZeroedBlocks counts blocks deallocated between base and target
 	// (delta runs): their ranges were returned to holes.
 	ZeroedBlocks int
+	// Streamed is true when the output is a chunked .img.szc container
+	// built without materializing the raw image.
+	Streamed bool
 }
 
 // Manager downloads snapshots using a worker pool over a block source.
@@ -149,10 +156,16 @@ func (m *Manager) Run(ctx context.Context, req *Request) (*Result, error) {
 	start := time.Now()
 
 	if req.Force {
-		for _, p := range []string{req.ManifestPath, req.StatePath, req.ImagePath, req.ImagePath + ".zst"} {
+		for _, p := range []string{req.ManifestPath, req.StatePath, req.ImagePath, req.ImagePath + ".zst", req.SZCPath()} {
 			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 				return nil, fmt.Errorf("force-cleaning %s: %w", p, err)
 			}
+		}
+	}
+
+	if req.Stream {
+		if req.BaseManifest != nil {
+			return nil, fmt.Errorf("streaming mode does not support incremental sync (--base-manifest)")
 		}
 	}
 
@@ -174,6 +187,12 @@ func (m *Manager) Run(ctx context.Context, req *Request) (*Result, error) {
 	}
 	if err != nil {
 		return nil, err
+	}
+
+	// One-shot streaming pipeline: chunked container, no journal, no raw
+	// image, self-verifying.
+	if req.Stream {
+		return m.runStream(ctx, req, man, lister)
 	}
 
 	jrn, err := OpenJournal(req.StatePath, req.SnapshotID, len(man.Blocks), req.baseSnapshotID())

@@ -37,6 +37,7 @@ var downloadFlags struct {
 	egressPerGB    float64
 	wait           time.Duration
 	baseManifest   string
+	stream         bool
 }
 
 var downloadCmd = &cobra.Command{
@@ -71,6 +72,7 @@ func init() {
 	f.BoolVar(&downloadFlags.rootOnly, "root-only", false, "AMI: download only the root volume")
 	f.DurationVar(&downloadFlags.wait, "wait", 0, "wait up to this duration for pending snapshots to complete, e.g. --wait 15m (default: fail fast)")
 	f.StringVar(&downloadFlags.baseManifest, "base-manifest", "", "incremental mode: manifest of a previously downloaded snapshot in the same volume lineage; only changed blocks are fetched (snapshot mode only)")
+	f.BoolVar(&downloadFlags.stream, "stream", false, "compress chunk-by-chunk while downloading into a seekable .img.szc container; no raw image on disk, no resume")
 	f.BoolVar(&downloadFlags.quiet, "quiet", false, "suppress the progress display")
 	f.Float64Var(&downloadFlags.egressPerGB, "egress-per-gb", 0.09, "USD per GB of internet data-transfer-out used in --dry-run cost estimates (set 0 to ignore egress, e.g. when running inside AWS)")
 }
@@ -96,6 +98,14 @@ func runDownload(cmd *cobra.Command, args []string) error {
 	}
 	if downloadFlags.zstdLevel < 1 || downloadFlags.zstdLevel > 19 {
 		return fmt.Errorf("--zstd-level must be 1-19")
+	}
+	if downloadFlags.stream {
+		if downloadFlags.baseManifest != "" {
+			return fmt.Errorf("--stream does not support --base-manifest")
+		}
+		if downloadFlags.keepRaw || downloadFlags.noCompress {
+			return fmt.Errorf("--stream produces only the .img.szc container; --keep-raw/--no-compress do not apply")
+		}
 	}
 
 	// Incremental mode: load the base manifest and, if the raw base
@@ -182,8 +192,11 @@ func runDownload(cmd *cobra.Command, args []string) error {
 			StatePath:    job.state,
 			Force:        downloadFlags.force,
 			BaseManifest: baseMan,
+			Stream:       downloadFlags.stream,
 		}
-		if !downloadFlags.noCompress {
+		if downloadFlags.stream {
+			req.Compress = &dl.CompressOptions{Level: downloadFlags.zstdLevel}
+		} else if !downloadFlags.noCompress {
 			req.Compress = &dl.CompressOptions{Level: downloadFlags.zstdLevel, KeepRaw: downloadFlags.keepRaw}
 		}
 		res, err := dl.New(source, opts).Run(ctx, req)

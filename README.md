@@ -67,6 +67,7 @@ Credentials and region resolve through the standard AWS chain (env vars,
 | `--root-only` | off | AMI mode: only the root volume |
 | `--wait` | off | wait up to e.g. `--wait 15m` for pending snapshots to complete before downloading |
 | `--base-manifest` | off | incremental sync: fetch only blocks changed since this completed base manifest (snapshot mode) |
+| `--stream` | off | compress chunk-by-chunk during download into a seekable `.img.szc`; no raw image, no resume |
 | `--state-dir` | alongside output | where resume journals live |
 | `--egress-per-gb` | 0.09 | USD/GB internet egress rate used in `--dry-run` cost estimates (0 = ignore egress, e.g. inside AWS) |
 
@@ -159,6 +160,41 @@ snaport download snap-B --base-manifest snap-A.manifest.json -o snap-A.img
   identical to one - the test suite and `snaport selftest` both assert
   this. `--dry-run` prints the delta plan (blocks to fetch, blocks
   zeroed, reused count, cost).
+
+## Streaming mode (.img.szc)
+
+`--stream` targets tight disks: blocks are compressed into the final
+container as they arrive, so the raw image is never materialized and
+peak disk usage is roughly the compressed output alone.
+
+```
+snaport download snap-... --stream          # produces snap-....img.szc + manifest
+snaport verify snap-....img.szc             # self-contained verify (no manifest needed)
+```
+
+Trade-offs: an interrupted streamed run restarts from scratch (no
+journal) and incremental sync is not available in this mode - the
+default raw-image pipeline keeps both.
+
+**Container format** (documented so the artifact is never a black box;
+all integers big-endian):
+
+```
+[4]  magic "SZTC"      [4] format version (u32)
+...  chunk records: [8] logical offset, [4] uncompressed length,
+     [4] compressed length, then one independent zstd frame
+...  trailer JSON: geometry, per-chunk index (offsets, sizes,
+     SHA-256 of each chunk's uncompressed data), whole-image SHA-256
+[16] footer: trailer offset (u64), trailer length (u32),
+     CRC32 of the trailer bytes
+```
+
+Unallocated and all-zero blocks are simply not stored; readers
+synthesize zeros, so the container is as storage-efficient as the
+sparse raw image. Chunks compress independently, so any block can be
+decoded by seeking to it alone - `snaport verify` decodes chunk-by-
+chunk, and the format is directly usable for random access from Go via
+`img.NewSZCReader`.
 
 ## Cost estimation
 
@@ -281,13 +317,10 @@ ramps back up when calm. If you consistently throttle, lower
 
 ## Limitations / future work
 
-- Compression is a whole-image zstd stream (universally decodable); a
-  seekable/chunked archive would allow random access without full
-  decompression.
+- The default (non-stream) compression is a whole-image zstd stream
+  (universally decodable); use `--stream` when random access matters.
 - The manifest records every block as JSON; multi-tens-of-millions of
   blocks (fully-allocated very large volumes) makes it large (~100 B/block).
-- Streaming download→compression without materializing the raw image
-  would eliminate the peak double-hold.
 - Windows: the console progress display works in Windows Terminal and
   conhost; redirected output gets periodic plain lines instead.
 

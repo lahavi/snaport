@@ -557,3 +557,60 @@ func TestManagerDeltaGrowVolume(t *testing.T) {
 		t.Fatal("new block beyond the old volume end missing from delta manifest")
 	}
 }
+
+func TestManagerStreamMatchesFullDownload(t *testing.T) {
+	fake, _ := newTestEnv(t, 70)
+	dir := t.TempDir()
+
+	// Streaming run into its own directory.
+	streamReq := deltaPaths(dir, fake.SnapshotID)
+	streamReq.Stream = true
+	streamReq.Compress = &CompressOptions{Level: 3}
+	streamRes, err := New(fake, Options{Concurrency: 8}).Run(context.Background(), streamReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !streamRes.Streamed {
+		t.Fatal("result not marked as streamed")
+	}
+
+	// Only the container + manifest may exist: no raw image, no journal.
+	if _, err := os.Stat(streamReq.ImagePath); !os.IsNotExist(err) {
+		t.Fatal("raw image was materialized in stream mode")
+	}
+	if _, err := os.Stat(streamReq.StatePath); !os.IsNotExist(err) {
+		t.Fatal("journal was created in stream mode")
+	}
+	if _, err := os.Stat(streamReq.SZCPath()); err != nil {
+		t.Fatalf("container missing: %v", err)
+	}
+
+	// A full download of the same snapshot must hash identically.
+	fullReq := deltaPaths(t.TempDir(), fake.SnapshotID)
+	fullRes, err := New(fake, Options{Concurrency: 4}).Run(context.Background(), fullReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if streamRes.ImageSHA256 != fullRes.ImageSHA256 {
+		t.Fatalf("streamed hash %s != full hash %s", streamRes.ImageSHA256, fullRes.ImageSHA256)
+	}
+
+	// The manifest must be complete and the container self-verify.
+	if streamRes.Manifest.Compression == nil || !streamRes.Manifest.Compression.Verified {
+		t.Fatalf("stream manifest compression: %+v", streamRes.Manifest.Compression)
+	}
+	for i, b := range streamRes.Manifest.Blocks {
+		if b.SHA256 == "" || b.Length == 0 {
+			t.Fatalf("stream manifest block ordinal %d incomplete", i)
+		}
+	}
+}
+
+func TestManagerStreamRejectsDelta(t *testing.T) {
+	fake, req := newTestEnv(t, 10)
+	req.Stream = true
+	req.BaseManifest = &manifest.Manifest{SnapshotID: "snap-other"}
+	if _, err := New(fake, Options{}).Run(context.Background(), req); err == nil {
+		t.Fatal("expected stream+delta rejection")
+	}
+}

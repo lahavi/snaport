@@ -49,6 +49,22 @@ func runVerify(cmd *cobra.Command, args []string) error {
 }
 
 func verifyOne(ctx context.Context, path, manifestPath string) error {
+	// The chunked container is self-describing: verify it directly from
+	// its own trailer, no manifest needed.
+	if strings.HasSuffix(path, ".img.szc") {
+		fmt.Printf("verifying chunked container %s ...\n", filepath.Base(path))
+		trailer, err := img.OpenSZC(path)
+		if err != nil {
+			return err
+		}
+		if err := img.VerifySZC(ctx, path, trailer, nil); err != nil {
+			return err
+		}
+		fmt.Printf("PASS %s: %d chunks, decoded image sha256 %s\n",
+			path, len(trailer.Chunks), trailer.ImageSHA256)
+		return nil
+	}
+
 	if manifestPath == "" {
 		manifestPath = inferManifestPath(path)
 	}
@@ -115,10 +131,12 @@ func verifyAMIDir(ctx context.Context, dir string) error {
 	}
 	for _, vol := range top.Volumes {
 		image := filepath.Join(dir, vol.ImageFile)
-		if _, err := os.Stat(image + ".zst"); err == nil {
+		if _, err := os.Stat(image + ".szc"); err == nil {
+			image += ".szc"
+		} else if _, err := os.Stat(image + ".zst"); err == nil {
 			image += ".zst"
 		} else if _, err := os.Stat(image); err != nil {
-			return fmt.Errorf("volume %s: neither %s.zst nor %s found", vol.Device, image, image)
+			return fmt.Errorf("volume %s: none of %s.szc/.zst/.img found", vol.Device, image)
 		}
 		manifestPath := filepath.Join(dir, vol.Manifest)
 		fmt.Printf("== %s (%s, %s)\n", vol.SnapshotID, vol.Device, filepath.Base(image))
